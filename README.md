@@ -19,11 +19,17 @@ This Python script scans readable files in AWS S3 buckets for sensitive informat
 
 1. Ensure your AWS credentials are configured `aws configure`. You can also do this by setting environment variables or using the AWS credentials file.
 
-2. Run the script:
-    ```bash
-    python s3_scanner.py
-    ```
-
+2. Usage:
+   To scan specific buckets:
+```bash
+Copy code
+python s3_scanner.py -b bucket1 bucket2
+```
+   To scan all accessible buckets:
+```bash
+Copy code
+python s3_scanner.py
+```
 ## Example Output
 
 ![](https://raw.githubusercontent.com/dazzyddos/aws_s3_scanner/main/s3scan.png)
