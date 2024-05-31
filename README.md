@@ -22,12 +22,10 @@ This Python script scans readable files in AWS S3 buckets for sensitive informat
 2. Usage:
    To scan specific buckets:
 ```bash
-Copy code
 python s3_scanner.py -b bucket1 bucket2
 ```
    To scan all accessible buckets:
 ```bash
-Copy code
 python s3_scanner.py
 ```
 ## Example Output
