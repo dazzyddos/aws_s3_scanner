@@ -4,6 +4,7 @@ import io
 import json
 import xml.etree.ElementTree as ET
 import yaml
+import logging
 from configparser import ConfigParser
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from docx import Document
@@ -12,16 +13,21 @@ import csv
 from prettytable import PrettyTable
 import textwrap
 from colorama import init, Fore, Style
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 init(autoreset=True)
+
+# Initialize logging
+logging.basicConfig(filename='s3_scanner.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def scan_sensitive_info(data):
     patterns = [
         r'password\s*=\s*["\']?([^"\']+)',
         r'pass\s*=\s*["\']?([^"\']+)',
         r'pw\s*=\s*["\']?([^"\']+)',
-        r'cred\s*=\\s*["\']?([^"\']+)',
-        r'credential\s*=\\s*["\']?([^"\']+)',
+        r'cred\s*=\s*["\']?([^"\']+)',
+        r'credential\s*=\s*["\']?([^"\']+)',
         r'User Id=([^;]+);Password=([^;]+);',
         r'(A3T[A-Z0-9]|AKIA|AGPA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}',
         r'(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40}(?![A-Za-z0-9+/])',
@@ -102,56 +108,82 @@ def process_object(bucket_name, key, content, results):
         elif key.endswith('.sql'):
             data = read_sql_file(content)
         else:
+            logging.info(f"Skipping unsupported file type: {key}")
             print(f"Skipping unsupported file type: {key}")
             return
 
         sensitive_info = scan_sensitive_info(data)
         if sensitive_info:
+            logging.info(f"Sensitive information found in {bucket_name}/{key}")
             print(Fore.YELLOW + f"Sensitive information found in {bucket_name}/{key}:")
             for info in sensitive_info:
                 print(info)
                 results.append((f"{bucket_name}/{key}", info))
         else:
+            logging.info(f"No sensitive information found in {bucket_name}/{key}")
             print(Fore.GREEN + f"No sensitive information found in {bucket_name}/{key}.")
     except Exception as e:
+        logging.error(f"Could not process object {key} in bucket {bucket_name}: {e}")
         print(Fore.RED + f"Could not process object {key} in bucket {bucket_name}: {e}")
 
-def read_s3_buckets():
+def read_s3_buckets(bucket_names=None):
     results = []
     try:
         s3 = boto3.client('s3')
         buckets = s3.list_buckets()
 
-        for bucket in buckets['Buckets']:
-            bucket_name = bucket['Name']
-            print(Fore.CYAN + f"Scanning bucket: {bucket_name}")
-            
-            try:
-                objects = s3.list_objects_v2(Bucket=bucket_name)
+        existing_buckets = {bucket['Name'] for bucket in buckets['Buckets']}
+        if bucket_names:
+            for bucket_name in bucket_names:
+                if bucket_name not in existing_buckets:
+                    logging.error(f"Bucket {bucket_name} does not exist")
+                    print(Fore.RED + f"Bucket {bucket_name} does not exist")
+            bucket_names = [bucket for bucket in bucket_names if bucket in existing_buckets]
+        else:
+            bucket_names = existing_buckets
 
-                if 'Contents' not in objects:
-                    print(Fore.YELLOW + f"Bucket {bucket_name} is empty or not accessible.")
-                    continue
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for bucket_name in bucket_names:
+                logging.info(f"Scanning bucket: {bucket_name}")
+                print(Fore.CYAN + f"Scanning bucket: {bucket_name}")
+                
+                try:
+                    objects = s3.list_objects_v2(Bucket=bucket_name)
 
-                for obj in objects['Contents']:
-                    key = obj['Key']
-                    print(f"Reading object: {key}")
+                    if 'Contents' not in objects:
+                        logging.warning(f"Bucket {bucket_name} is empty or not accessible")
+                        print(Fore.YELLOW + f"Bucket {bucket_name} is empty or not accessible.")
+                        continue
 
-                    try:
-                        file_obj = s3.get_object(Bucket=bucket_name, Key=key)
-                        file_content = file_obj['Body'].read()
+                    for obj in objects['Contents']:
+                        key = obj['Key']
+                        logging.info(f"Reading object: {key}")
+                        print(f"Reading object: {key}")
 
-                        process_object(bucket_name, key, file_content, results)
-                    except Exception as e:
-                        print(Fore.RED + f"Could not read object {key} in bucket {bucket_name}: {e}")
-            
-            except Exception as e:
-                print(Fore.RED + f"Could not list objects in bucket {bucket_name}: {e}")
+                        futures.append(executor.submit(process_object_async, s3, bucket_name, key, results))
+                
+                except Exception as e:
+                    logging.error(f"Could not list objects in bucket {bucket_name}: {e}")
+                    print(Fore.RED + f"Could not list objects in bucket {bucket_name}: {e}")
+
+            for future in as_completed(futures):
+                future.result()
     
     except (NoCredentialsError, PartialCredentialsError):
+        logging.error("Error: AWS credentials not configured properly")
         print(Fore.RED + "Error: AWS credentials not configured properly.")
 
     return results
+
+def process_object_async(s3, bucket_name, key, results):
+    try:
+        file_obj = s3.get_object(Bucket=bucket_name, Key=key)
+        file_content = file_obj['Body'].read()
+        process_object(bucket_name, key, file_content, results)
+    except Exception as e:
+        logging.error(f"Could not read object {key} in bucket {bucket_name}: {e}")
+        print(Fore.RED + f"Could not read object {key} in bucket {bucket_name}: {e}")
 
 def print_results_table(results):
     table = PrettyTable()
@@ -166,5 +198,9 @@ def print_results_table(results):
     print(Fore.CYAN + str(table))
 
 if __name__ == "__main__":
-    results = read_s3_buckets()
+    parser = argparse.ArgumentParser(description="S3 Sensitive Information Scanner. ")
+    parser.add_argument('-b', '--buckets', nargs='+', help='List of S3 buckets to scan else it will scan through all readable buckets', default=None)
+    args = parser.parse_args()
+
+    results = read_s3_buckets(args.buckets)
     print_results_table(results)
